@@ -17,18 +17,26 @@ if __name__ == '__main__':
     participant_pattern = 'P??'
 
     for participant_dir in data_dir.glob(participant_pattern):
-        for modality in ['rgb_frames', 'flow_frames']:
-            if modality == 'rgb_frames':
+        for modality in ['flow_frames', 'rgb_frames']:
+            if modality in ['rgb_frames']:
                 video_id_pattern = 'P??_*??/'
             else:
                 video_id_pattern = 'P??_*??/*/'
 
+
             frames_dir = participant_dir / modality
             for source_file in frames_dir.glob(video_id_pattern):
-                if modality == 'rgb_frames':
+                if modality in ['rgb_frames']:
                     video = str(source_file).split('/')[-1:]
                 else:
                     video, _ = str(source_file).split('/')[-2:]
+
+                # done midification
+                if '.tar' in video[0]:
+                    continue
+                else:
+                    if modality in ['rgb_frames']:
+                        video = video[0]
 
                 link_path = args.symlinks_dir / video
                 if not link_path.exists():
