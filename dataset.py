@@ -1,4 +1,4 @@
-from video_records import EpicKitchens55_VideoRecord, EpicKitchens100_VideoRecord
+from video_records import EpicKitchens55_VideoRecord, EpicKitchens100_VideoRecord, EpicKitchens55Custom1_VideoRecord
 import torch.utils.data as data
 
 import librosa
@@ -25,6 +25,7 @@ class TBNDataSet(data.Dataset):
                 self.audio_path = Path(audio_path)
             else:
                 self.audio_path = pickle.load(open(audio_path, 'rb'))
+
         self.visual_path = visual_path
         self.list_file = list_file
         self.num_segments = num_segments
@@ -87,13 +88,26 @@ class TBNDataSet(data.Dataset):
     def _load_data(self, modality, record, idx):
         if modality == 'RGB' or modality == 'RGBDiff':
             idx_untrimmed = record.start_frame + idx
-            return [Image.open(os.path.join(self.visual_path, record.untrimmed_video_name, self.image_tmpl[modality].format(idx_untrimmed))).convert('RGB')]
+            img_path = os.path.join(self.visual_path, record.untrimmed_video_name, self.image_tmpl[modality].format(idx_untrimmed))
+            if os.path.exists(img_path):
+                img = [Image.open(img_path).convert('RGB')]
+            else:
+                #print('Not found, RGB: {}'.format(self.image_tmpl[modality].format(idx_untrimmed)))
+                img = [Image.new('RGB',(456,256))]
+            return img
         elif modality == 'Flow':
             rgb2flow_fps_ratio = record.fps['Flow'] / float(record.fps['RGB'])
             idx_untrimmed = int(np.floor((record.start_frame * rgb2flow_fps_ratio))) + idx
-            x_img = Image.open(os.path.join(self.visual_path, record.untrimmed_video_name, self.image_tmpl[modality].format('x', idx_untrimmed))).convert('L')
-            y_img = Image.open(os.path.join(self.visual_path, record.untrimmed_video_name, self.image_tmpl[modality].format('y', idx_untrimmed))).convert('L')
-            return [x_img, y_img]
+            x_img_path = os.path.join(self.visual_path, record.untrimmed_video_name, self.image_tmpl[modality].format('x', idx_untrimmed))
+            y_img_path = os.path.join(self.visual_path, record.untrimmed_video_name, self.image_tmpl[modality].format('y', idx_untrimmed))
+            if (os.path.exists(x_img_path) and os.path.exists(y_img_path)):
+                x_img = Image.open(x_img_path).convert('L')
+                y_img = Image.open(y_img_path).convert('L')
+                imgs = [x_img, y_img]
+            else:
+                #print('Not found, Flow: {} or {}'.format(self.image_tmpl[modality].format('x', idx_untrimmed), self.image_tmpl[modality].format('y', idx_untrimmed)))
+                imgs = [Image.new('L',(456,256)), Image.new('L',(456,256))]
+            return imgs
         elif modality == 'Spec':
             spec = self._extract_sound_feature(record, idx)
             return [Image.fromarray(spec)]
@@ -103,6 +117,9 @@ class TBNDataSet(data.Dataset):
             self.video_list = [EpicKitchens55_VideoRecord(tup) for tup in self.list_file.iterrows()]
         elif self.dataset == 'epic-kitchens-100':
             self.video_list = [EpicKitchens100_VideoRecord(tup) for tup in self.list_file.iterrows()]
+        elif self.dataset == 'epic-kitchens-55-custom-1':
+            self.video_list = [EpicKitchens55Custom1_VideoRecord(tup) for tup in self.list_file.iterrows() if tup[1]['mode'] == self.mode]
+        print('dataset[{}] num={}'.format(self.mode, len(self.video_list)))
 
     def _sample_indices(self, record, modality):
         """
@@ -140,6 +157,9 @@ class TBNDataSet(data.Dataset):
         input = {}
         record = self.video_list[index]
 
+        ###tmp
+        #print('{} / {} / {}'.format(record.untrimmed_video_name, record.start_frame, record.end_frame))
+
         for m in self.modality:
             if self.mode == 'train':
                 segment_indices = self._sample_indices(record, m)
@@ -164,10 +184,10 @@ class TBNDataSet(data.Dataset):
             if m != 'RGB' and self.mode == 'train':
                 np.random.shuffle(segment_indices)
 
-            img, label = self.get(m, record, segment_indices)
+            img, label, meta = self.get(m, record, segment_indices)
             input[m] = img
 
-        return input, label
+        return input, label, meta
 
     def get(self, modality, record, indices):
 

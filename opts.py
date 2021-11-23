@@ -1,7 +1,7 @@
 import argparse
 parser = argparse.ArgumentParser(description="PyTorch implementation of Temporal Binding Network")
 parser.add_argument('dataset', type=str, choices=['ucf101', 'hmdb51', 'kinetics', 'epic-kitchens-55',
-                                                  'epic-kitchens-100'])
+                                                  'epic-kitchens-100', 'epic-kitchens-55-custom-1'])
 parser.add_argument('modality', type=str, nargs='+', choices=['RGB', 'Flow', 'RGBDiff', 'Spec'],
 	                default=['RGB', 'Flow', 'Spec'])
 parser.add_argument('--train_list', type=str)
