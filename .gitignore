@@ -12,3 +12,11 @@ sftp-config*.json
 *.o*
 *.err*
 .DS_Store
+
+custom_archive/*
+custom_downloader/*
+custom_deployer/*
+custom_annotation/annotations/details/*
+custom_annotation/annotations/processed/*
+custom_annotation/annotations/raw/*
+result/*
