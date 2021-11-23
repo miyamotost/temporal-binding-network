@@ -2,11 +2,15 @@ import os
 import argparse
 import time
 
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.parallel
 import torch.optim
 from sklearn.metrics import confusion_matrix, accuracy_score
 import pandas as pd
+
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 from dataset import TBNDataSet
 from models import TBN
@@ -47,13 +51,24 @@ def evaluate_model(num_class):
               dropout=args.dropout,
               midfusion=args.midfusion)
 
-    weights = '{weights_dir}/model_best.pth.tar'.format(
+    #weights = '{weights_dir}/model_best.pth.tar'.format(
+    weights = '{weights_dir}'.format(
         weights_dir=args.weights_dir)
     checkpoint = torch.load(weights)
     print("model epoch {} best prec@1: {}".format(checkpoint['epoch'], checkpoint['best_prec1']))
 
     base_dict = {'.'.join(k.split('.')[1:]): v for k,v in list(checkpoint['state_dict'].items())}
     net.load_state_dict(base_dict)
+
+    """
+    if args.dataset == 'epic-kitchens-55-custom-1':
+        num_class = list(num_class)
+        num_class[0] = 10
+        num_class = tuple(num_class)
+        net.fusion_classification_net.fc_verb = nn.Linear(net.fusion_classification_net.fc_verb.in_features, num_class[0])
+        print('test: model.fusion_classification_net.fc_verb')
+        print(net.fusion_classification_net.fc_verb)
+    """
 
     test_transform = {}
     image_tmpl = {}
@@ -93,6 +108,16 @@ def evaluate_model(num_class):
 
     data_length = net.new_length
 
+    #df = df[df['participant_id'].str.contains('P01')]
+    #print(df)
+    #print(df[df['video_id'].str.contains('P01_0[1-9]|P01_1[0-7]')])
+    #print(df[df['participant_id'].str.contains('P01')])
+    #print(df[df['video_id'].str.contains('P01_10')])
+
+    mode = 'test'
+    if args.dataset == 'epic-kitchens-55-custom-1':
+        mode = 'val'
+
     test_loader = torch.utils.data.DataLoader(
         TBNDataSet(args.dataset,
                    pd.read_pickle(args.test_list),
@@ -102,7 +127,7 @@ def evaluate_model(num_class):
                    visual_path=args.visual_path,
                    audio_path=args.audio_path,
                    num_segments=args.test_segments,
-                   mode='test',
+                   mode=mode,
                    transform=test_transform,
                    resampling_rate=args.resampling_rate),
         batch_size=1, shuffle=False,
@@ -117,7 +142,15 @@ def evaluate_model(num_class):
 
         proc_start_time = time.time()
         max_num = args.max_num if args.max_num > 0 else total_num
+        print('max_num: {}'.format(max_num))
+
         for i, (data, label, meta) in enumerate(test_loader):
+        #for i, sample in enumerate(test_loader):
+            #data, label, meta = sample['data'].cuda(), sample['label'].cuda(), sample['meta'].cuda()
+
+            #try:
+            if i%100 == 0:
+                print('current iter: {}'.format(i))
             if i >= max_num:
                 break
             rst = eval_video(data, net, num_class, device)
@@ -132,11 +165,13 @@ def evaluate_model(num_class):
             cnt_time = time.time() - proc_start_time
             print('video {} done, total {}/{}, average {} sec/video'.format(
                 i, i + 1, total_num, float(cnt_time) / (i + 1)))
+            #except:
+            #    pass
 
         return results
 
 
-def print_accuracy(scores, labels):
+def print_accuracy(scores, labels, detail_flag=False):
 
     video_pred = [np.argmax(np.mean(score, axis=0)) for score in scores]
     cf = confusion_matrix(labels, video_pred).astype(float)
@@ -149,6 +184,50 @@ def print_accuracy(scores, labels):
 
     print('Accuracy {:.02f}%'.format(acc * 100))
     print('Average Class Accuracy {:.02f}%'.format(np.mean(cls_acc) * 100))
+
+    if (detail_flag is not False and detail_flag == 'VERB'):
+        # get label
+        # TODO: external util class
+        f_con = open('./custom_annotation/annotations/label.txt', 'r', encoding='UTF-8')
+        index = []
+        for line in f_con:
+            line = line.replace('\n', '')
+            line = line.split(', ')
+            index.append(line[1])
+        f_con.close()
+
+        # save image
+        cf = pd.DataFrame(data=cf, index=index, columns=index)
+        sns.heatmap(cf, cmap='Blues')
+        plt.xlabel('prediction')
+        plt.ylabel('actual')
+        plt.rcParams['figure.subplot.bottom'] = 0.20
+        plt.rcParams['figure.subplot.left'] = 0.20
+        plt.savefig('./result/cm/sklearn_confusion_matrix_test_VERB_{}.png'.format(args.dataset))
+        plt.clf()
+
+        cls_acc = cls_acc*100
+        cls_acc = pd.DataFrame(data=cls_acc, index=index)
+        plt.rcParams['figure.subplot.bottom'] = 0.20
+        plt.figure();
+        cls_acc.plot(kind='bar');
+        plt.savefig('./result/bar_acc.png')
+        plt.clf()
+
+        cls_hit = pd.DataFrame(data=cls_hit, index=index)
+        plt.rcParams['figure.subplot.bottom'] = 0.20
+        plt.figure();
+        cls_hit.plot(kind='bar');
+        plt.savefig('./result/bar_hit.png')
+        plt.clf()
+
+        cls_cnt = pd.DataFrame(data=cls_cnt, index=index)
+        plt.rcParams['figure.subplot.bottom'] = 0.20
+        plt.figure();
+        cls_cnt.plot(kind='bar');
+        plt.savefig('./result/bar_cnt.png')
+        plt.clf()
+
 
 
 def save_scores(results, scores_file):
@@ -175,7 +254,7 @@ def main():
     parser = argparse.ArgumentParser(description="Standard video-level" +
                                      " testing")
     parser.add_argument('dataset', type=str,
-                        choices=['ucf101', 'hmdb51', 'kinetics', 'epic-kitchens-55', 'epic-kitchens-100'])
+                        choices=['ucf101', 'hmdb51', 'kinetics', 'epic-kitchens-55', 'epic-kitchens-100', 'epic-kitchens-55-custom-1'])
     parser.add_argument('modality', type=str,
                         choices=['RGB', 'Flow', 'RGBDiff', 'Spec'],
                         nargs='+', default=['RGB', 'Flow', 'Spec'])
@@ -216,6 +295,8 @@ def main():
         num_class = (125, 352)
     elif args.dataset == 'epic-kitchens-100':
         num_class = (97, 300)
+    elif args.dataset == 'epic-kitchens-55-custom-1':
+        num_class = (125, 352) # custom dataset
     else:
         raise ValueError('Unknown dataset ' + args.dataset)
 
@@ -225,7 +306,8 @@ def main():
         for task in keys:
             print('Evaluation of {}'.format(task.upper()))
             print_accuracy([result[0][task] for result in results],
-                           [result[1][task] for result in results])
+                           [result[1][task] for result in results],
+                           detail_flag=task.upper())
     else:
         print_accuracy([result[0] for result in results],
                        [result[1] for result in results])
