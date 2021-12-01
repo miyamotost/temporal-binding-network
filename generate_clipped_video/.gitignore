@@ -1,0 +1,8 @@
+tmp/*
+!tmp/.gitkeep
+
+input_video/*
+!input_video/.gitkeep
+
+output_video/*
+!output_video/.gitkeep
