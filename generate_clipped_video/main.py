@@ -18,7 +18,7 @@ def convert_time_to_second(str1, str2):
 # init
 INPUT_DIR = 'symlink'
 OUTPUT_DIR = 'symlink'
-dataset = pd.read_pickle('../custom_annotation/annotations/EPIC_custom_action_labels.pkl')
+dataset = pd.read_pickle('../custom_annotation/annotations/EPIC_custom_action_labels_splited.pkl')
 dataset = dataset.sort_values('video_id')
 current_video = None
 cap = None
