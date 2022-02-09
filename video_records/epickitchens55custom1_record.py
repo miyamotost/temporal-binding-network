@@ -36,4 +36,9 @@ class EpicKitchens55Custom1_VideoRecord(VideoRecord):
 
     @property
     def metadata(self):
-        return {'uid': self._index}
+        return {
+            'uid': self._index,
+            'video_id': self._series['video_id'],
+            'start_frame': self._series['start_frame'],
+            'stop_frame': self._series['stop_frame']
+        }
