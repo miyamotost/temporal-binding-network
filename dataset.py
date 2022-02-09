@@ -37,6 +37,8 @@ class TBNDataSet(data.Dataset):
         self.resampling_rate = resampling_rate
         self.use_audio_dict = use_audio_dict
 
+        self.not_found_frames_video_id = []
+
         if 'RGBDiff' in self.modality:
             self.new_length['RGBDiff'] += 1  # Diff needs one more image to calculate diff
 
@@ -92,7 +94,9 @@ class TBNDataSet(data.Dataset):
             if os.path.exists(img_path):
                 img = [Image.open(img_path).convert('RGB')]
             else:
-                #print('Not found, RGB: {}'.format(self.image_tmpl[modality].format(idx_untrimmed)))
+                #print('Not found, RGB: {} {}'.format(record.untrimmed_video_name, self.image_tmpl[modality].format(idx_untrimmed)))
+                if record.untrimmed_video_name not in self.not_found_frames_video_id:
+                    self.not_found_frames_video_id.append(record.untrimmed_video_name)
                 img = [Image.new('RGB',(456,256))]
             return img
         elif modality == 'Flow':
@@ -106,6 +110,8 @@ class TBNDataSet(data.Dataset):
                 imgs = [x_img, y_img]
             else:
                 #print('Not found, Flow: {} or {}'.format(self.image_tmpl[modality].format('x', idx_untrimmed), self.image_tmpl[modality].format('y', idx_untrimmed)))
+                if record.untrimmed_video_name not in self.not_found_frames_video_id:
+                    self.not_found_frames_video_id.append(record.untrimmed_video_name)
                 imgs = [Image.new('L',(456,256)), Image.new('L',(456,256))]
             return imgs
         elif modality == 'Spec':
@@ -187,10 +193,11 @@ class TBNDataSet(data.Dataset):
             img, label, meta = self.get(m, record, segment_indices)
             input[m] = img
 
+        meta['not_found_frames_video_id'] = self.not_found_frames_video_id
+
         return input, label, meta
 
     def get(self, modality, record, indices):
-
         images = list()
         for seg_ind in indices:
             p = int(seg_ind)
