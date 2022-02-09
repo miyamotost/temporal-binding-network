@@ -25,6 +25,13 @@ best_prec1 = 0
 training_iterations = 0
 best_loss = 10000000
 
+not_found_frames_video_ids = []
+def aggregate_not_found(idss):
+    for ids in idss:
+        for id in ids:
+            if id not in not_found_frames_video_ids:
+                not_found_frames_video_ids.append(id)
+
 args = parser.parse_args()
 lr_steps_str = list(map(lambda k: str(int(k)), args.lr_steps))
 experiment_name = '_'.join((args.dataset, args.arch,
@@ -289,6 +296,8 @@ def main():
             'best_prec1': best_prec1,
             }, is_best, 'checkpoint_epoch_{}.pth.tar'.format(epoch + 1))
 
+        print('train.py: not found video ids(epoch_{}) -> {}'.format(epoch, not_found_frames_video_ids))
+
     summaryWriter.close()
 
     if args.save_stats:
@@ -326,7 +335,9 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
 
     end = time.time()
 
-    for i, (input, target, _) in enumerate(train_loader):
+    for i, (input, target, meta) in enumerate(train_loader):
+        aggregate_not_found(meta['not_found_frames_video_id'])
+
         # measure data loading time
 
         data_time.update(time.time() - end)
@@ -490,7 +501,9 @@ def validate(val_loader, model, criterion, device, epoch=None):
         verb_targets = []
 
         end = time.time()
-        for i, (input, target, _) in enumerate(val_loader):
+        for i, (input, target, meta) in enumerate(val_loader):
+            aggregate_not_found(meta['not_found_frames_video_id'])
+
             for m in args.modality:
                 input[m] = input[m].to(device)
 
@@ -679,18 +692,24 @@ def get_confusion_matrix(output, target, epoch=None):
     pred = pred.to('cpu').detach().numpy().copy()
     target = target.to('cpu').detach().numpy().copy()
     cm = confusion_matrix(target, pred)
+    #cm = confusion_matrix(target, pred, labels=index)
     print(cm)
 
     # show
     if epoch is not None:
-        cm = pd.DataFrame(data=cm, index=index, columns=index)
-        sns.heatmap(cm, cmap='Blues')
-        plt.xlabel('prediction')
-        plt.ylabel('actual')
-        plt.rcParams['figure.subplot.bottom'] = 0.20
-        plt.rcParams['figure.subplot.left'] = 0.20
-        plt.savefig('./result/cm/sklearn_confusion_matrix_{}_{}.png'.format(args.dataset, epoch))
-        plt.clf()
+        try:
+            # TODO: Elimination of try catch error
+            cm = pd.DataFrame(data=cm, index=index, columns=index)
+            sns.heatmap(cm, cmap='Blues')
+            plt.xlabel('prediction')
+            plt.ylabel('actual')
+            plt.rcParams['figure.subplot.bottom'] = 0.20
+            plt.rcParams['figure.subplot.left'] = 0.20
+            plt.savefig('./result/cm/sklearn_confusion_matrix_{}_{}.png'.format(args.dataset, epoch))
+            plt.clf()
+        except ValueError:
+            print('ValueError: pandas')
+            pass
 
 
 def multitask_accuracy(outputs, labels, topk=(1,)):
