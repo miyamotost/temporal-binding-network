@@ -2,12 +2,17 @@ import argparse
 parser = argparse.ArgumentParser(description="PyTorch implementation of Temporal Binding Network")
 parser.add_argument('dataset', type=str, choices=['ucf101', 'hmdb51', 'kinetics', 'epic-kitchens-55',
                                                   'epic-kitchens-100', 'epic-kitchens-55-custom-1'])
-parser.add_argument('modality', type=str, nargs='+', choices=['RGB', 'Flow', 'RGBDiff', 'Spec'],
+parser.add_argument('modality', type=str, nargs='+',
+                    choices=['RGB', 'Flow', 'RGBDiff', 'Spec', 'HandBox', 'HandBoxMask', 'HandTraj', 'OnlyHandTrajLSTM'],
 	                default=['RGB', 'Flow', 'Spec'])
+parser.add_argument('--model_name', type=str, default="")
 parser.add_argument('--train_list', type=str)
 parser.add_argument('--val_list', type=str)
 parser.add_argument('--visual_path', type=str, default="")
 parser.add_argument('--audio_path', type=str, default="")
+parser.add_argument('--handbox_path', type=str, default="")
+parser.add_argument('--handboxmask_path', type=str, default="")
+parser.add_argument('--handtraj_path', type=str, default="")
 
 # ========================= Model Configs ==========================
 parser.add_argument('--arch', type=str, default="resnet101")

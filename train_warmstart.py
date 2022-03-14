@@ -21,16 +21,40 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+
 best_prec1 = 0
 training_iterations = 0
 best_loss = 10000000
-
+train_results, validate_results = [], []
 not_found_frames_video_ids = []
+
 def aggregate_not_found(idss):
     for ids in idss:
         for id in ids:
             if id not in not_found_frames_video_ids:
                 not_found_frames_video_ids.append(id)
+
+def collate_fn(batch):
+    if 'HandTraj' in args.modality:
+        input, input_len = [], []
+        for b in batch:
+            input.append(b[0]['HandTraj'].squeeze(0))
+            input_len.append(b[0]['HandTraj'].shape[1])
+
+        input_len = torch.tensor(input_len) #[batch]
+        padded = pad_sequence(input, batch_first=True) #[batch, len(var), size] -> [batch, max_len, size]
+
+        for i, _ in enumerate(batch):
+            batch[i][0]['HandTraj'] =  padded[i][np.newaxis, :, :]
+
+    # default collate function
+    data, label, meta = torch.utils.data._utils.collate.default_collate(batch)
+
+    if 'HandTraj' in args.modality:
+        data['HandTraj_length'] = input_len
+
+    return data, label, meta
 
 args = parser.parse_args()
 lr_steps_str = list(map(lambda k: str(int(k)), args.lr_steps))
@@ -71,7 +95,8 @@ def main():
                 base_model=args.arch,
                 consensus_type=args.consensus_type,
                 dropout=args.dropout,
-                midfusion=args.midfusion)
+                midfusion=args.midfusion,
+                model_name=args.model_name)
 
     crop_size = model.crop_size
     scale_size = model.scale_size
@@ -139,7 +164,7 @@ def main():
     # Data loading code
     normalize = {}
     for m in args.modality:
-        if (m != 'Spec'):
+        if (m not in ['Spec', 'HandBox', 'HandBoxMask', 'HandTraj']):
             if (m != 'RGBDiff'):
                 normalize[m] = GroupNormalize(input_mean[m], input_std[m])
             else:
@@ -150,7 +175,7 @@ def main():
     train_transform = {}
     val_transform = {}
     for m in args.modality:
-        if (m != 'Spec'):
+        if (m not in ['Spec', 'HandBox', 'HandBoxMask', 'HandTraj']):
             # Prepare dictionaries containing image name templates for each modality
             if m in ['RGB', 'RGBDiff']:
                 image_tmpl[m] = "img_{:010d}.jpg"
@@ -173,7 +198,20 @@ def main():
                 ToTorchFormatTensor(div=args.arch != 'BNInception'),
                 normalize[m],
             ])
-        else:
+        elif (m in ['HandBoxMask']):
+            train_transform[m] = torchvision.transforms.Compose([
+                train_augmentation[m],
+                Stack(roll=args.arch == 'BNInception'),
+                ToTorchFormatTensor(div=args.arch != 'BNInception'),
+            ])
+
+            val_transform[m] = torchvision.transforms.Compose([
+                GroupScale(int(scale_size[m])),
+                GroupCenterCrop(crop_size[m]),
+                Stack(roll=args.arch == 'BNInception'),
+                ToTorchFormatTensor(div=args.arch != 'BNInception'),
+            ])
+        elif (m in ['Spec', 'HandBox']):
             # Prepare train/val dictionaries containing the transformations
             # (augmentation+normalization)
             # for each modality
@@ -186,52 +224,71 @@ def main():
                 Stack(roll=args.arch == 'BNInception'),
                 ToTorchFormatTensor(div=False),
             ])
+        else: # HandTraj
+            print('{} do not transform'.format(m))
+
 
     print('train.py: args.workers={}'.format(args.workers))
 
-    train_loader = torch.utils.data.DataLoader(
-        TBNDataSet(args.dataset,
-                   pd.read_pickle(args.train_list),
-                   data_length,
-                   args.modality,
-                   image_tmpl,
-                   visual_path=args.visual_path,
-                   audio_path=args.audio_path,
-                   num_segments=args.num_segments,
-                   transform=train_transform,
-                   resampling_rate=args.resampling_rate),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True)
+    train_dataset = TBNDataSet(args.dataset,
+                               pd.read_pickle(args.train_list),
+                               data_length,
+                               args.modality,
+                               image_tmpl,
+                               visual_path=args.visual_path,
+                               audio_path=args.audio_path,
+                               handbox_path=args.handbox_path,
+                               handboxmask_path=args.handboxmask_path,
+                               handtraj_path=args.handtraj_path,
+                               num_segments=args.num_segments,
+                               transform=train_transform,
+                               resampling_rate=args.resampling_rate)
 
-    print('train.py: prepared training loader.')
+    val_dataset =   TBNDataSet(args.dataset,
+                               pd.read_pickle(args.val_list),
+                               data_length,
+                               args.modality,
+                               image_tmpl,
+                               visual_path=args.visual_path,
+                               audio_path=args.audio_path,
+                               handbox_path=args.handbox_path,
+                               handboxmask_path=args.handboxmask_path,
+                               handtraj_path=args.handtraj_path,
+                               num_segments=args.num_segments,
+                               mode='val',
+                               transform=val_transform,
+                               resampling_rate=args.resampling_rate)
 
-    val_loader = torch.utils.data.DataLoader(
-        TBNDataSet(args.dataset,
-                   pd.read_pickle(args.val_list),
-                   data_length,
-                   args.modality,
-                   image_tmpl,
-                   visual_path=args.visual_path,
-                   audio_path=args.audio_path,
-                   num_segments=args.num_segments,
-                   mode='val',
-                   transform=val_transform,
-                   resampling_rate=args.resampling_rate),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
-
-    print('train.py: prepared validation loader.')
+    if 'HandTraj' in args.modality:
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                                   num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+        val_loader   = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                                   num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    else:
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                                   num_workers=args.workers, pin_memory=True)
+        val_loader   = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                                   num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
     criterion = torch.nn.CrossEntropyLoss()
 
+    hand_traj_lr = 0.001
     if len(args.modality) > 1:
-        param_groups = [
-                        {'params': filter(lambda p: p.requires_grad, model.module.rgb.parameters())},
-                        {'params': filter(lambda p: p.requires_grad, model.module.flow.parameters()), 'lr': 0.001},
-                        {'params': filter(lambda p: p.requires_grad, model.module.spec.parameters())},
-                        {'params': filter(lambda p: p.requires_grad, model.module.fusion_classification_net.parameters())},
-                       ]
+        param_groups = []
+        for m in args.modality:
+            if m == 'flow':
+                param_groups.append({'params': filter(lambda p: p.requires_grad, model.module.flow.parameters()), 'lr': 0.001})
+            elif m == 'HandTraj':
+                param_groups.append({'params': filter(lambda p: p.requires_grad, model.module.handtraj.parameters()), 'lr': hand_traj_lr})
+            else:
+                t = getattr(model.module, m.lower())
+                param_groups.append({'params': filter(lambda p: p.requires_grad, t.parameters())})
+        param_groups.append({'params': filter(lambda p: p.requires_grad, model.module.fusion_classification_net.parameters())})
+    elif len(args.modality) == 1 and 'HandTraj' in args.modality:
+        param_groups = []
+        param_groups.append({'params': filter(lambda p: p.requires_grad, model.module.handtraj.parameters()), 'lr': hand_traj_lr})
+        param_groups.append({'params': filter(lambda p: p.requires_grad, model.module.fusion_classification_net.parameters())})
     else:
         param_groups = filter(lambda p: p.requires_grad, model.parameters())
 
@@ -298,6 +355,11 @@ def main():
 
         print('train.py: not found video ids(epoch_{}) -> {}'.format(epoch, not_found_frames_video_ids))
 
+    print('---------- train_results ----------')
+    [print(i) for i in train_results]
+    print('---------- validate_results ----------')
+    [print(i) for i in validate_results]
+
     summaryWriter.close()
 
     if args.save_stats:
@@ -315,6 +377,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
+    top3 = AverageMeter()
     top5 = AverageMeter()
     if 'epic' in args.dataset:
         verb_losses = AverageMeter()
@@ -323,6 +386,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
         verb_top3 = AverageMeter()
         verb_top5 = AverageMeter()
         noun_top1 = AverageMeter()
+        noun_top3 = AverageMeter()
         noun_top5 = AverageMeter()
 
     # switch to train mode
@@ -336,17 +400,12 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
     end = time.time()
 
     for i, (input, target, meta) in enumerate(train_loader):
-        aggregate_not_found(meta['not_found_frames_video_id'])
-
-        # measure data loading time
-
         data_time.update(time.time() - end)
 
         for m in args.modality:
             input[m] = input[m].to(device)
 
-        # compute output
-        output = model(input)
+        output = model(input) # input[m].shape = [batch_size, consensus x channel, img x, img y]
         batch_size = input[args.modality[0]].size(0)
         if 'epic' not in args.dataset:
             target = target.to(device)
@@ -368,16 +427,18 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
             verb_top3.update(verb_prec3, batch_size)
             verb_top5.update(verb_prec5, batch_size)
 
-            noun_prec1, noun_prec5 = accuracy(noun_output, target['noun'], topk=(1, 5))
+            noun_prec1, noun_prec3, noun_prec5 = accuracy(noun_output, target['noun'], topk=(1, 3, 5))
             noun_top1.update(noun_prec1, batch_size)
+            noun_top3.update(noun_prec3, batch_size)
             noun_top5.update(noun_prec5, batch_size)
 
-            prec1, prec5 = multitask_accuracy((verb_output, noun_output),
+            prec1, prec3, prec5 = multitask_accuracy((verb_output, noun_output),
                                               (target['verb'], target['noun']),
-                                              topk=(1, 5))
+                                              topk=(1, 3, 5))
 
         losses.update(loss.item(), batch_size)
         top1.update(prec1, batch_size)
+        top3.update(prec3, batch_size)
         top5.update(prec5, batch_size)
 
         # compute gradient and do SGD step
@@ -452,20 +513,24 @@ def train(train_loader, model, criterion, optimizer, epoch, device):
                            'Verb Loss {verb_loss.avg:.4f} ({verb_loss.avg:.4f})\t' +
                            'Noun Loss {noun_loss.avg:.4f} ({noun_loss.avg:.4f})\t' +
                            'Prec@1 {top1.avg:.3f} ({top1.avg:.3f})\t' +
+                           'Prec@3 {top3.avg:.3f} ({top3.avg:.3f})\t' +
                            'Prec@5 {top5.avg:.3f} ({top5.avg:.3f})\t' +
                            'Verb Prec@1 {verb_top1.avg:.3f} ({verb_top1.avg:.3f})\t' +
                            'Verb Prec@3 {verb_top3.avg:.3f} ({verb_top3.avg:.3f})\t' +
                            'Verb Prec@5 {verb_top5.avg:.3f} ({verb_top5.avg:.3f})\t' +
                            'Noun Prec@1 {noun_top1.avg:.3f} ({noun_top1.avg:.3f})\t' +
+                           'Noun Prec@3 {noun_top3.avg:.3f} ({noun_top3.avg:.3f})\t' +
                            'Noun Prec@5 {noun_top5.avg:.3f} ({noun_top5.avg:.3f})'
                            ).format(
                     epoch, i, len(train_loader), batch_time=batch_time,
                     data_time=data_time, loss=losses, verb_loss=verb_losses,
-                    noun_loss=noun_losses, top1=top1, top5=top5,
+                    noun_loss=noun_losses, top1=top1, top3=top3, top5=top5,
                     verb_top1=verb_top1, verb_top3=verb_top3, verb_top5=verb_top5,
-                    noun_top1=noun_top1, noun_top5=noun_top5, lr=optimizer.param_groups[-1]['lr'])
+                    noun_top1=noun_top1, noun_top3=noun_top3, noun_top5=noun_top5, lr=optimizer.param_groups[-1]['lr'])
 
+            train_results.append(message)
             print(message)
+
     if 'epic' not in args.dataset:
         training_metrics = {'train_loss': losses.avg, 'train_acc': top1.avg}
     else:
@@ -485,6 +550,7 @@ def validate(val_loader, model, criterion, device, epoch=None):
         batch_time = AverageMeter()
         losses = AverageMeter()
         top1 = AverageMeter()
+        top3 = AverageMeter()
         top5 = AverageMeter()
         if 'epic' in args.dataset:
             verb_losses = AverageMeter()
@@ -493,6 +559,7 @@ def validate(val_loader, model, criterion, device, epoch=None):
             verb_top3 = AverageMeter()
             verb_top5 = AverageMeter()
             noun_top1 = AverageMeter()
+            noun_top3 = AverageMeter()
             noun_top5 = AverageMeter()
         # switch to evaluate mode
         model.eval()
@@ -534,16 +601,18 @@ def validate(val_loader, model, criterion, device, epoch=None):
                 verb_top3.update(verb_prec3, batch_size)
                 verb_top5.update(verb_prec5, batch_size)
 
-                noun_prec1, noun_prec5 = accuracy(noun_output, target['noun'], topk=(1, 5))
+                noun_prec1, noun_prec3, noun_prec5 = accuracy(noun_output, target['noun'], topk=(1, 3, 5))
                 noun_top1.update(noun_prec1, batch_size)
+                noun_top3.update(noun_prec3, batch_size)
                 noun_top5.update(noun_prec5, batch_size)
 
-                prec1, prec5 = multitask_accuracy((verb_output, noun_output),
+                prec1, prec3, prec5 = multitask_accuracy((verb_output, noun_output),
                                                   (target['verb'], target['noun']),
-                                                  topk=(1, 5))
+                                                  topk=(1, 3, 5))
 
             losses.update(loss.item(), batch_size)
             top1.update(prec1, batch_size)
+            top3.update(prec3, batch_size)
             top5.update(prec5, batch_size)
 
             # measure elapsed time
@@ -605,18 +674,20 @@ def validate(val_loader, model, criterion, device, epoch=None):
 
             message = ("Testing Results: "
                        "Verb Prec@1 {verb_top1.avg:.3f} Verb Prec@3 {verb_top3.avg:.3f} Verb Prec@5 {verb_top5.avg:.3f} "
-                       "Noun Prec@1 {noun_top1.avg:.3f} Noun Prec@5 {noun_top5.avg:.3f} "
-                       "Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} "
+                       "Noun Prec@1 {noun_top1.avg:.3f} Noun Prec@3 {noun_top3.avg:.3f} Noun Prec@5 {noun_top5.avg:.3f} "
+                       "Prec@1 {top1.avg:.3f} Prec@3 {top3.avg:.3f} Prec@5 {top5.avg:.3f} "
                        "Verb Loss {verb_loss.avg:.5f} "
                        "Noun Loss {noun_loss.avg:.5f} "
                        "Loss {loss.avg:.5f}").format(verb_top1=verb_top1, verb_top3=verb_top3, verb_top5=verb_top5,
-                                                     noun_top1=noun_top1, noun_top5=noun_top5,
-                                                     top1=top1, top5=top5,
+                                                     noun_top1=noun_top1, noun_top3=noun_top3, noun_top5=noun_top5,
+                                                     top1=top1, top3=top3, top5=top5,
                                                      verb_loss=verb_losses,
                                                      noun_loss=noun_losses,
                                                      loss=losses)
 
+        validate_results.append(message)
         print(message)
+
         if 'epic' not in args.dataset:
             test_metrics = {'val_loss': losses.avg, 'val_acc': top1.avg}
         else:

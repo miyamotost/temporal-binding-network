@@ -11,6 +11,10 @@ sftp-config*.json
 /.idea/*
 *.o*
 *.err*
+r*
+serial.*
+*.txt
+*.sh
 .DS_Store
 
 custom_archive/*

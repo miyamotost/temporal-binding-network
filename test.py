@@ -116,22 +116,21 @@ def evaluate_model(num_class):
 
     mode = 'test'
     if args.dataset == 'epic-kitchens-55-custom-1':
-        mode = 'val'
+        mode = 'test'
 
-    test_loader = torch.utils.data.DataLoader(
-        TBNDataSet(args.dataset,
-                   pd.read_pickle(args.test_list),
-                   data_length,
-                   args.modality,
-                   image_tmpl,
-                   visual_path=args.visual_path,
-                   audio_path=args.audio_path,
-                   num_segments=args.test_segments,
-                   mode=mode,
-                   transform=test_transform,
-                   resampling_rate=args.resampling_rate),
-        batch_size=1, shuffle=False,
-        num_workers=args.workers * 2)
+    tbn_dataset = TBNDataSet(args.dataset,
+                            pd.read_pickle(args.test_list),
+                            data_length,
+                            args.modality,
+                            image_tmpl,
+                            visual_path=args.visual_path,
+                            audio_path=args.audio_path,
+                            num_segments=args.test_segments,
+                            mode=mode,
+                            transform=test_transform,
+                            resampling_rate=args.resampling_rate)
+
+    test_loader = torch.utils.data.DataLoader(tbn_dataset, batch_size=1, shuffle=False, num_workers=args.workers * 2)
 
     net = torch.nn.DataParallel(net, device_ids=args.gpus).to(device)
     with torch.no_grad():
@@ -163,8 +162,26 @@ def evaluate_model(num_class):
                 results.append((rst, label_, meta))
 
             cnt_time = time.time() - proc_start_time
-            print('video {} done, total {}/{}, average {} sec/video'.format(
-                i, i + 1, total_num, float(cnt_time) / (i + 1)))
+            if args.dataset == 'epic-kitchens-55-custom-1':
+                print('video {} done, total {}/{}, average {} sec/video, video_id {}'.format(
+                    i, i + 1, total_num, float(cnt_time) / (i + 1), meta['video_id'][0]
+                    ))
+
+
+                if meta['video_id'][0] == 'P28_05':
+                    print(label)
+                    print(data['RGB'].shape)
+                    print(data['Flow'].shape)
+                    print(data['Spec'].shape)
+                    print(meta['start_frame'])
+                    print(meta['stop_frame'])
+                    exit()
+
+
+            else:
+                print('video {} done, total {}/{}, average {} sec/video'.format(
+                    i, i + 1, total_num, float(cnt_time) / (i + 1)
+                    ))
             #except:
             #    pass
 
@@ -186,6 +203,11 @@ def print_accuracy(scores, labels, detail_flag=False):
     print('Average Class Accuracy {:.02f}%'.format(np.mean(cls_acc) * 100))
 
     if (detail_flag is not False and detail_flag == 'VERB'):
+        print('test labels size: {}'.format(len(labels)))
+        print(labels)
+        print('test preds size: {}'.format(len(video_pred)))
+        print(video_pred)
+
         # get label
         # TODO: external util class
         f_con = open('./custom_annotation/annotations/label.txt', 'r', encoding='UTF-8')
@@ -198,12 +220,16 @@ def print_accuracy(scores, labels, detail_flag=False):
 
         # save image
         cf = pd.DataFrame(data=cf, index=index, columns=index)
-        sns.heatmap(cf, cmap='Blues')
+
         plt.xlabel('prediction')
         plt.ylabel('actual')
-        plt.rcParams['figure.subplot.bottom'] = 0.20
-        plt.rcParams['figure.subplot.left'] = 0.20
-        plt.savefig('./result/cm/sklearn_confusion_matrix_test_VERB_{}.png'.format(args.dataset))
+        plt.rcParams['figure.subplot.bottom'] = 0.30
+        plt.rcParams['figure.subplot.left'] = 0.25
+
+        plt.figure()
+        sns.heatmap(cf, cmap='Blues')
+
+        plt.savefig('./result/cm/sklearn_confusion_matrix_test_VERB_{}_{}.png'.format(args.dataset, '_'.join(args.modality)))
         plt.clf()
 
         cls_acc = cls_acc*100

@@ -3,14 +3,57 @@ from fusion_classification_network import Fusion_Classification_Network
 from transforms import *
 from collections import OrderedDict
 
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+
+
+class HandBoxNetwork(nn.Module):
+    def __init__(self):
+        super(HandBoxNetwork, self).__init__()
+        self.fc1 = nn.Linear(100, 16)
+
+    def forward(self, input):
+        input = input.view((-1, 100)) # [12, sample_len=5, 2, 10] -> [12, 100]
+        output = self.fc1(input)      # [12, 100] -> [12, 16]
+        return output
+
+class HandTrajNetwork(nn.Module):
+    def __init__(self, hand_traj_dim, hidden_dim):
+        super(HandTrajNetwork, self).__init__()
+        self.hand_traj_dim = hand_traj_dim
+        self.hidden_dim = hidden_dim
+        self.lstm = nn.LSTM(input_size = hand_traj_dim,
+                            hidden_size = hidden_dim,
+                            batch_first = True)
+
+    def forward(self, input):
+        input = input.float()
+        output, (h, c) = self.lstm(input, None)
+        #output = output[:, -1, :] # [batch_size x sequence_length x hidden_size] -> [batch_size x 1(last time) x hidden_size]
+        #output = output.squeeze(1) # [batch_size x 1 x hidden_size] -> [batch_size x hidden_size]
+        return output, (h, c)
+
+class HandTrajNetwork2(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(HandTrajNetwork2, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, input):
+        #input = input.view((-1, 100)) # [12, sample_len=5, 2, 10] -> [12, 100]
+        #output = self.fc1(input)      # [12, 100] -> [12, 16]
+        hidden = self.fc1(input)
+        output = self.fc2(hidden)
+        return output
+
+
 
 class TBN(nn.Module):
 
     def __init__(self, num_class, num_segments, modality,
                  base_model='resnet101', new_length=None,
                  consensus_type='avg', before_softmax=True,
-                 dropout=0.8,
-                 crop_num=1, midfusion='concat'):
+                 dropout=0.8, crop_num=1, midfusion='concat',
+                 model_name=''):
         super(TBN, self).__init__()
         self.num_class = num_class
         self.modality = modality
@@ -20,15 +63,15 @@ class TBN(nn.Module):
         self.crop_num = crop_num
         self.consensus_type = consensus_type
         self.midfusion = midfusion
+        self.model_name = model_name
         if not before_softmax and consensus_type != 'avg':
             raise ValueError("Only avg consensus can be used after Softmax")
 
         self.new_length = OrderedDict()
         if new_length is None:
             for m in self.modality:
-                self.new_length[m] = 1 if (m == "RGB" or m == "Spec") else 5
+                self.new_length[m] = 1 if (m in ["RGB", "Spec", "HandBoxMask"]) else 5
         else:
-            
             self.new_length = new_length
 
         print(("""
@@ -42,25 +85,33 @@ TSN Configurations:
         """.format(base_model, self.modality, self.num_segments, self.new_length, consensus_type, self.dropout)))
 
         self._prepare_base_model(base_model)
-
         self._prepare_tbn()
 
-        is_flow = any(m=='Flow' for m in self.modality)
-        is_diff = any(m=='RGBDiff' for m in self.modality)
-        is_spec = any(m=='Spec' for m in self.modality)
-        if is_flow:
-            print("Converting the ImageNet model to a flow init model")
-            self.base_model['Flow'] = self._construct_flow_model(self.base_model['Flow'])
-            print("Done. Flow model ready...")
-        if is_diff:
-            print("Converting the ImageNet model to RGB+Diff init model")
-            self.base_model['RGBDiff'] = self._construct_diff_model(self.base_model['RGBDiff'])
-            print("Done. RGBDiff model ready.")
-        if is_spec:
-            print("Converting the ImageNet model to a spectrogram init model")
-            self.base_model['Spec'] = self._construct_spec_model(self.base_model['Spec'])
-            print("Done. Spec model ready.")
-
+        for m in self.modality:
+            if m=='Flow':
+                print("Converting the ImageNet model to a flow init model")
+                self.base_model['Flow'] = self._construct_flow_model(self.base_model['Flow'])
+            if m=='RGBDiff':
+                print("Converting the ImageNet model to RGB+Diff init model")
+                self.base_model['RGBDiff'] = self._construct_diff_model(self.base_model['RGBDiff'])
+            if m=='Spec':
+                print("Converting the ImageNet model to a spectrogram init model")
+                self.base_model['Spec'] = self._construct_spec_model(self.base_model['Spec'])
+            if m=='HandBox':
+                print("Set a handbox init model")
+                self.base_model['HandBox'] = HandBoxNetwork()
+            if m=='HandTraj':
+                print("Set a handtraj init model")
+                if self.model_name == 'LSTM_all':
+                    self.bn_handtraj = nn.BatchNorm1d(12)
+                    self.base_model['HandTraj'] = HandTrajNetwork(12, 1024) # trajectory dim, hidden dim
+                elif self.model_name == 'FFN_all':
+                    self.base_model['HandTraj'] = HandTrajNetwork2(24000, 2048, 1024)
+                    #self.base_model['HandTraj'] = HandTrajNetwork2(8000, 2048, 1024)
+                    #self.base_model['HandTraj'] = HandTrajNetwork2(16000, 2048, 1024)
+                else:
+                    print('invalid model_name!')
+                    exit()
         print('\n')
 
         for m in self.modality:
@@ -153,32 +204,80 @@ TSN Configurations:
 
     def forward(self, input):
         concatenated = []
-        # Get the output for each modality
         for m in self.modality:
-            if (m == 'RGB'):
-                channel = 3
-            elif (m == 'Flow'):
-                channel = 2
-            elif (m == 'Spec'):
+            if (m == 'HandBox'):
                 channel = 1
-            sample_len = channel * self.new_length[m]
+                sample_len = channel * self.new_length[m] # TODO: channel と new_lengthの見直し
+                base_model = getattr(self, m.lower())
+                input[m] = input[m].view((-1, sample_len) + input[m].size()[-2:]) # view((-1, sample_len=5, 2, 10)) -> [12, sample_len=5, 2, 10]
+                base_out = base_model(input[m]) # [12, sample_len=5, 2, 10] => [12, ?]
+            elif (m == 'HandTraj'):
+                base_model = getattr(self, m.lower())
+                if self.model_name == "LSTM_all":
+                    sample_len = 1*1 # channel × new_length
+                    seq_length = input['HandTraj_length'].to("cpu").to(torch.int64)
+                    t = input[m]
+                    t = t.squeeze(1)
 
-            if m == 'RGBDiff':
-                sample_len = 3 * self.new_length[m]
-                input[m] = self._get_diff(input[m])
-            base_model = getattr(self, m.lower())
-            base_out = base_model(input[m].view((-1, sample_len) + input[m].size()[-2:]))
+                    # TODO: 正規化
+                    #print('bn')
+                    #print(t[:, :, -1])
+                    #t = torch.permute(t, (0, 2, 1))
+                    #t = self.bn_handtraj(t)
+                    #t = torch.permute(t, (0, 2, 1))
+                    #print(t[:, :, -1])
+                    t = pack_padded_sequence(t, seq_length, batch_first=True, enforce_sorted=False)  # [batch, max_len, size] -> [batch x seq_len, 12]
+                    #print(t.data.shape)
 
-            base_out = base_out.view(base_out.size(0), -1)
+                    input[m] = t
+                    output, _ = base_model(input[m])
+                    output, seq_length = pad_packed_sequence(output, batch_first=True)
+
+                    base_out = []
+                    for i, out in enumerate(output):                                  # [batch, max_len, hidden] -> [batch, hidden]
+                        last = out[seq_length[i]-1, :]                                # [max_len, hidden] -> [hidden]
+                        last = last.unsqueeze(0)                                      # [hidden] -> [1, hidden]
+                        last = torch.cat((last, last, last), 0)                       # [1, hidden] -> [cons, hidden]
+                        base_out.append(last)
+                    base_out = torch.stack(base_out)                                  # list of [cons, hidden] -> [batch, cons, hidden]
+                    base_out = base_out.view((-1, sample_len) + base_out.size()[-1:]) # [batch, cons, hidden] -> [batch × cons, 1, hidden]
+                    base_out = base_out.squeeze(1)                                    # [batch × cons, 1, hidden] -> [batch × cons, hidden]
+                elif self.model_name == "FFN_all":
+                    print('FFN_all')
+                    exit()
+                else:
+                    print('choose model_name!')
+                    exit()
+                    #(1)input[m] = input[m].view((-1, sample_len) + input[m].size()[-2:]) # [batch, cons, frames, elements] -> [batch x cons, 1, frames, elements]
+                    #input[m] = input[m].view((-1, sample_len) + input[m].size()[-1:]) #(2)
+                    #input[m] = torch.reshape(input[m], (12, 16000))
+            else:
+                if (m == 'RGB'):
+                    channel = 3
+                elif (m == 'Flow'):
+                    channel = 2
+                elif (m == 'Spec'):
+                    channel = 1
+                elif (m == 'HandBoxMask'):
+                    channel = 3
+                sample_len = channel * self.new_length[m]
+
+                if m == 'RGBDiff':
+                    sample_len = 3 * self.new_length[m]
+                    input[m] = self._get_diff(input[m])
+
+                base_model = getattr(self, m.lower())
+                base_out = base_model(input[m].view((-1, sample_len) + input[m].size()[-2:]))
+                base_out = base_out.view(base_out.size(0), -1)
             concatenated.append(base_out)
 
         output = self.fusion_classification_net(concatenated)
-        
+
         return output
 
     def _get_diff(self, input, keep_rgb=False):
         input_c = 3
-        input_view = input.view((-1, self.num_segments, self.new_length['RGBDiff'] + 1, input_c,) 
+        input_view = input.view((-1, self.num_segments, self.new_length['RGBDiff'] + 1, input_c,)
             + input.size()[2:])
         if keep_rgb:
             new_data = input_view.clone()
@@ -306,6 +405,9 @@ TSN Configurations:
                                                    GroupRandomHorizontalFlip(is_flow=True)])
         if 'RGBDiff' in self.modality:
             augmentation['RGBDiff'] = torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size['RGBDiff'], [1, .875, .75]),
+                                                   GroupRandomHorizontalFlip(is_flow=False)])
+        if 'HandBoxMask' in self.modality:
+            augmentation['HandBoxMask'] = torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size['HandBoxMask'], [1, .875, .75, .66]),
                                                    GroupRandomHorizontalFlip(is_flow=False)])
 
         return augmentation

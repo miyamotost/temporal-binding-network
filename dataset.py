@@ -1,4 +1,5 @@
 from video_records import EpicKitchens55_VideoRecord, EpicKitchens100_VideoRecord, EpicKitchens55Custom1_VideoRecord
+import torch
 import torch.utils.data as data
 
 import librosa
@@ -11,14 +12,13 @@ import numpy as np
 from numpy.random import randint
 import pickle
 
+from torch.nn.utils.rnn import pad_sequence
 
 class TBNDataSet(data.Dataset):
     def __init__(self, dataset, list_file,
                  new_length, modality, image_tmpl,
-                 visual_path=None, audio_path=None,
-                 resampling_rate=44000,
-                 num_segments=3, transform=None,
-                 mode='train', use_audio_dict=True):
+                 visual_path=None, audio_path=None, handbox_path=None, handboxmask_path=None, handtraj_path=None,
+                 resampling_rate=44000, num_segments=3, transform=None, mode='train', use_audio_dict=True):
         self.dataset = dataset
         if audio_path is not None:
             if not use_audio_dict:
@@ -27,6 +27,9 @@ class TBNDataSet(data.Dataset):
                 self.audio_path = pickle.load(open(audio_path, 'rb'))
 
         self.visual_path = visual_path
+        self.handbox_path = handbox_path
+        self.handboxmask_path = handboxmask_path
+        self.handtraj_path = handtraj_path
         self.list_file = list_file
         self.num_segments = num_segments
         self.new_length = new_length
@@ -109,7 +112,6 @@ class TBNDataSet(data.Dataset):
                 y_img = Image.open(y_img_path).convert('L')
                 imgs = [x_img, y_img]
             else:
-                #print('Not found, Flow: {} or {}'.format(self.image_tmpl[modality].format('x', idx_untrimmed), self.image_tmpl[modality].format('y', idx_untrimmed)))
                 if record.untrimmed_video_name not in self.not_found_frames_video_id:
                     self.not_found_frames_video_id.append(record.untrimmed_video_name)
                 imgs = [Image.new('L',(456,256)), Image.new('L',(456,256))]
@@ -117,6 +119,22 @@ class TBNDataSet(data.Dataset):
         elif modality == 'Spec':
             spec = self._extract_sound_feature(record, idx)
             return [Image.fromarray(spec)]
+        elif modality == 'HandBoxMask':
+            idx_untrimmed = record.start_frame + idx
+            handboxmask_dir = '{}/{}/{}_{}_{}'.format(self.handboxmask_path,
+                                                    record.participant_id, record.untrimmed_video_name,
+                                                    record.start_frame+1, record.end_frame+2)
+            img_path = '{}/{}'.format(handboxmask_dir, 'frame_{:010d}_det.png'.format(idx_untrimmed))
+
+            if os.path.exists(img_path):
+                img = [Image.open(img_path).convert('RGB')]
+            else:
+                #print('Not found, RGB: {} {}'.format(record.untrimmed_video_name, self.image_tmpl[modality].format(idx_untrimmed)))
+                if record.untrimmed_video_name not in self.not_found_frames_video_id:
+                    self.not_found_frames_video_id.append(record.untrimmed_video_name)
+                img = [Image.new('RGB',(456,256))]
+                print('not found handboxmask {}_{}'.format(record.untrimmed_video_name, idx_untrimmed))
+            return img
 
     def _parse_list(self):
         if self.dataset == 'epic-kitchens-55':
@@ -163,10 +181,19 @@ class TBNDataSet(data.Dataset):
         input = {}
         record = self.video_list[index]
 
-        ###tmp
         #print('{} / {} / {}'.format(record.untrimmed_video_name, record.start_frame, record.end_frame))
 
+        seq_length = -1
         for m in self.modality:
+            if m == 'HandTraj':
+                #no temporal binding (overall, start to stop)
+                #[1 x consensus size, frames(veriable length), trajectry elements]
+                #Ex1. [3, 2300, 2(x, y)], Ex2. [3, 2300, 4(x1, y1, x2, y2)]
+                img, label, meta = self.get(m, record, None)
+                input[m] = img
+                #seq_length = meta['hand_traj_seq_length']
+                continue
+
             if self.mode == 'train':
                 segment_indices = self._sample_indices(record, m)
             elif self.mode == 'val':
@@ -174,6 +201,7 @@ class TBNDataSet(data.Dataset):
             elif self.mode == 'test':
                 segment_indices = self._get_test_indices(record, m)
 
+            # TBWを実現するために、モダリティごとに、複数のindexを用いたリストを作成する。
             # We implement a Temporal Binding Window (TBW) with size same as the action's length by:
             #   1. Selecting different random indices (timestamps) for each modality within segments
             #      (this is similar to using a TBW with size same as the segment's size)
@@ -199,15 +227,155 @@ class TBNDataSet(data.Dataset):
 
     def get(self, modality, record, indices):
         images = list()
-        for seg_ind in indices:
-            p = int(seg_ind)
-            for i in range(self.new_length[modality]):
-                seg_imgs = self._load_data(modality, record, p)
-                images.extend(seg_imgs)
-                if p < record.num_frames[modality]:
-                    p += 1
 
-        process_data = self.transform[modality](images)
+        if modality == 'HandBox': # HandBox
+            handbox_fine_name = '{}_{}_{}.pkl'.format(record.untrimmed_video_name, record.start_frame+1, record.end_frame+2)
+            handbox_file_path = '{}/{}/{}'.format(self.handbox_path, record.participant_id, handbox_fine_name)
+            with open(handbox_file_path, 'rb') as f:
+                handbox_data = pickle.load(f)
+                handbox_indice = [int(d['frame_index'].replace('frame_', '').replace('.jpg', '')) for d in handbox_data]
+                c_sum = 0
+                c_not_found = 0
+                for seg_ind in indices:
+                    p = int(seg_ind)
+                    for i in range(self.new_length[modality]):
+                        c_sum += 1
+                        id = record.start_frame + p
+
+                        seg_imgs = None
+                        for i, frame in enumerate(handbox_indice):
+                            if frame == id:
+                                seg_imgs = handbox_data[i]['hand_dets'] # shape = [count, data]
+                                if seg_imgs is not None:
+                                    seg_imgs = seg_imgs[np.newaxis, :, :]   # shape = [1, count, data]
+                        if seg_imgs is None:
+                            #print('{}: seg_imgs is None at index_{}. use zeros.'.format(handbox_fine_name, id))
+                            c_not_found += 1
+                            seg_imgs = np.zeros((1, 2, 10))
+
+                        if seg_imgs.shape[1] == 1: # 手検出データが1つの場合は、空リストを使って2つにする。
+                            zeros = np.zeros((1, 1, seg_imgs.shape[2])).astype(np.float32)
+                            seg_imgs = np.concatenate([seg_imgs, zeros], 1)
+                        if seg_imgs.shape[1] >= 3: # 手検出データが3つ以上の場合は、最初の2つだけ使う
+                            seg_imgs = seg_imgs[:, :2, :]
+
+                        images.extend(seg_imgs)
+                        if p < record.num_frames[modality]:
+                            p += 1
+                #if c_not_found > 0:
+                #    print('{}: not found hand_dets -> {}/{}.'.format(handbox_fine_name, c_not_found, c_sum))
+            process_data = torch.from_numpy(np.array(images, dtype=np.float32))
+        elif modality == 'HandTraj':
+            filename = '{}_{}_{}.pkl'.format(record.untrimmed_video_name, record.start_frame+1, record.end_frame+2)
+            handbox_file_path = '{}/{}'.format(self.handtraj_path, filename)
+            max_length = 2000
+            """
+            if os.path.exists(handbox_file_path):
+                with open(handbox_file_path, 'rb') as f:
+                    handbox_data = pickle.load(f)
+                    hand_L, hand_R = np.array(handbox_data['hand_L']), np.array(handbox_data['hand_R'])
+                    if hand_L != [] and hand_R != []:
+                        hand_L, hand_R = hand_L[np.newaxis, :, :], hand_R[np.newaxis, :, :]
+                        hand_L, hand_R = hand_L[:, :, 4:6], hand_R[:, :, 4:6] # [center_x, center_y]
+                        hand = np.concatenate([hand_L, hand_R], 2) # [1, frame, :]
+                    else:
+                        print('hand_L and hand_R are empty.')
+                        hand = np.full((1, 1, 4), -1) # [1, frame, :]
+                    hand = np.concatenate([hand, hand, hand], 0)
+
+                    # same length with pad
+                    # [consensus, sequent length, elements] -> [consensus, max width, elements]
+                    try:
+                        hand = np.pad(hand, [(0, 0), (0, max_length - hand.shape[1]), (0, 0)], "constant")
+                    except ValueError:
+                        print(hand.shape[1], max_length, max_length - hand.shape[1])
+                        #exit()
+                        hand = hand[:, :max_length, :]
+            else:
+                print('{} is not found.'.format(filename))
+                hand = np.random.rand(3, max_length, 4)
+            """
+
+            """
+            if os.path.exists(handbox_file_path):
+                with open(handbox_file_path, 'rb') as f:
+                    handbox_data = pickle.load(f)
+                    hand_L, hand_R = np.array(handbox_data['hand_L']), np.array(handbox_data['hand_R'])
+                    if hand_L != [] and hand_R != []:
+                        hand_L, hand_R = hand_L[np.newaxis, :, :], hand_R[np.newaxis, :, :]
+                        hand_L, hand_R = hand_L[:, :, 0:4], hand_R[:, :, 0:4] # [x,y,x,y]
+                        hand = np.concatenate([hand_L, hand_R], 2) # [1, frame, 8]
+                    else:
+                        print('hand_L and hand_R are empty.')
+                        hand = np.full((1, 1, 8), -2) # [1, frame, :]
+                    hand = np.concatenate([hand, hand, hand], 0)
+
+                    # same length with pad
+                    # [consensus, sequent length, elements] -> [consensus, max width, elements]
+                    try:
+                        hand = np.pad(hand, [(0, 0), (0, max_length - hand.shape[1]), (0, 0)], "constant")
+                    except ValueError:
+                        print(hand.shape[1], max_length, max_length - hand.shape[1])
+                        #exit()
+                        hand = hand[:, :max_length, :]
+            else:
+                print('{} is not found.'.format(filename))
+                hand = np.random.rand(3, max_length, 8)
+            """
+
+            seq_length = 0
+            element_length = 12
+            if os.path.exists(handbox_file_path):
+                with open(handbox_file_path, 'rb') as f:
+                    handbox_data = pickle.load(f)
+                    hand_L, hand_R = np.array(handbox_data['hand_L']), np.array(handbox_data['hand_R'])
+                    if hand_L != [] and hand_R != []:
+                        hand_L, hand_R = hand_L[np.newaxis, :, :], hand_R[np.newaxis, :, :]
+                        hand_L, hand_R = hand_L[:, :, 0:6], hand_R[:, :, 0:6] # [x,y,x,y, cx, cy]
+                        hand = np.concatenate([hand_L, hand_R], 2) # [1, frame, 8]
+                    else:
+                        print('hand_L and hand_R are empty.')
+                        hand = np.full((1, 1, element_length), -2) # [1, frame, :]
+                    #hand = np.concatenate([hand, hand, hand], 0)
+
+                    # same length with pad
+                    # [consensus, sequent length, elements] -> [consensus, max width, elements]
+                    """
+                    custom padding
+                    try:
+                        seq_length = hand.shape[1]
+                        hand = np.pad(hand, [(0, 0), (0, max_length - hand.shape[1]), (0, 0)], "constant", constant_values=-2)
+                    except ValueError:
+                        print(hand.shape[1], max_length, max_length - hand.shape[1])
+                        #exit()
+                        seq_length = max_length # 軌道が最大長を超えるとき
+                        hand = hand[:, :max_length, :]
+                    """
+            else:
+                print('{} is not found.'.format(filename))
+                seq_length = 0 # 軌道が存在しない
+                hand = np.full((1, 1, element_length), -2)
+
+            #hand = hand.astype(np.float32)
+            hand = torch.from_numpy(np.array(hand, dtype=np.float32))
+            #hand = np.random.rand(3, 2000, 4)
+            #hand = np.random.rand(3, 16000).astype(np.float32)
+            #hand = torch.reshape(hand, (3, 8000)) # [3, 2000, 4] -> [3, 8000]
+            #()()hand = torch.reshape(hand, (3, 16000))
+            #hand = torch.reshape(hand, (3, 24000))
+            #print(hand[:, -3:])
+            process_data = hand
+            #record.metadata['hand_traj_seq_length'] = seq_length
+        else: # RGB, Flow, Spec, HandBoxMask
+            for seg_ind in indices:
+                p = int(seg_ind)
+                for i in range(self.new_length[modality]):
+                    seg_imgs = self._load_data(modality, record, p)
+                    images.extend(seg_imgs)
+                    if p < record.num_frames[modality]:
+                        p += 1
+            process_data = self.transform[modality](images)
+
         return process_data, record.label, record.metadata
 
     def __len__(self):

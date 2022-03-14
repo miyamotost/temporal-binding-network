@@ -23,16 +23,17 @@ class Fusion_Classification_Network(nn.Module):
         if not self.before_softmax:
             self.softmax = nn.Softmax()
 
+        # 手軌道モダリティは, 'concat', 'context_gating'のみ対応
         if len(self.modality) > 1:  # Fusion
-
-            if self.midfusion == 'concat':
-                self._add_audiovisual_fc_layer(len(self.modality) * feature_dim, 512)
+            if self.midfusion in ['concat', 'context_gating']:
+                if 'HandBox' in self.modality:
+                    input_dim = (len(self.modality)-1) * feature_dim + 16
+                else:
+                    input_dim = len(self.modality) * feature_dim
+                self._add_audiovisual_fc_layer(input_dim, 512)
                 self._add_classification_layer(512)
-
-            elif self.midfusion == 'context_gating':
-                self._add_audiovisual_fc_layer(len(self.modality) * feature_dim, 512)
-                self.context_gating = Context_Gating(512)
-                self._add_classification_layer(512)
+                if self.midfusion == 'context_gating':
+                    self.context_gating = Context_Gating(512)
 
             elif self.midfusion == 'multimodal_gating':
                 self.multimodal_gated_unit = Multimodal_Gated_Unit(feature_dim, 512)
@@ -44,7 +45,12 @@ class Fusion_Classification_Network(nn.Module):
             if self.dropout > 0:
                 self.dropout_layer = nn.Dropout(p=self.dropout)
 
-            self._add_classification_layer(feature_dim)
+            if 'HandBox' in self.modality:
+                input_dim = 16
+            else:
+                input_dim = feature_dim
+
+            self._add_classification_layer(input_dim)
 
     def _add_classification_layer(self, input_dim):
 
@@ -76,15 +82,12 @@ class Fusion_Classification_Network(nn.Module):
     def forward(self, inputs):
 
         if len(self.modality) > 1:  # Fusion
-            if self.midfusion == 'concat':
-                base_out = torch.cat(inputs, dim=1)
+            if self.midfusion in ['concat', 'context_gating']:
+                base_out = torch.cat(inputs, dim=1) # shape = [batch x consensus = 12, 3072]
                 base_out = self.fc1(base_out)
                 base_out = self.relu(base_out)
-            elif self.midfusion == 'context_gating':
-                base_out = torch.cat(inputs, dim=1)
-                base_out = self.fc1(base_out)
-                base_out = self.relu(base_out)
-                base_out = self.context_gating(base_out)
+                if self.midfusion == 'context_gating':
+                    base_out = self.context_gating(base_out)
             elif self.midfusion == 'multimodal_gating':
                 base_out = self.multimodal_gated_unit(inputs)
         else:  # Single modality
@@ -96,20 +99,20 @@ class Fusion_Classification_Network(nn.Module):
         # Snippet-level predictions and temporal aggregation with consensus
         if isinstance(self.num_class, (list, tuple)):  # Multi-task
             # Verb
-            base_out_verb = self.fc_verb(base_out)
+            base_out_verb = self.fc_verb(base_out) # [batch x consensus, hidden_dim] -> [batch x consensus, class_num]
             if not self.before_softmax:
                 base_out_verb = self.softmax(base_out_verb)
             if self.reshape:
-                base_out_verb = base_out_verb.view((-1, self.num_segments) + base_out_verb.size()[1:])
-            output_verb = self.consensus(base_out_verb)
+                base_out_verb = base_out_verb.view((-1, self.num_segments) + base_out_verb.size()[1:]) # (2) -> (3)
+            output_verb = self.consensus(base_out_verb) # [batch, consensus, class_num] -> [batch, 1, class_num]
 
             # Noun
-            base_out_noun = self.fc_noun(base_out)
+            base_out_noun = self.fc_noun(base_out) # [batch x consensus, hidden_dim] -> [batch x consensus, class_num]
             if not self.before_softmax:
                 base_out_noun = self.softmax(base_out_noun)
             if self.reshape:
-                base_out_noun = base_out_noun.view((-1, self.num_segments) + base_out_noun.size()[1:])
-            output_noun = self.consensus(base_out_noun)
+                base_out_noun = base_out_noun.view((-1, self.num_segments) + base_out_noun.size()[1:]) # (2) -> (3)
+            output_noun = self.consensus(base_out_noun) # [batch, consensus, class_num] -> [batch, 1, class_num]
 
             output = (output_verb.squeeze(1), output_noun.squeeze(1))
 
